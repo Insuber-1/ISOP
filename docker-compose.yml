@@ -1,0 +1,31 @@
+services:
+  word-editor:
+    image: node:18-slim
+    # ให้ Compose ตั้งชื่อ container ตาม project เช่น ai-server-management-word-editor-1
+    # ป้องกันชนกับ container ชื่อ word-editor ที่ค้างอยู่จากการติดตั้ง/Compose project เก่า
+    user: root  
+    working_dir: /app
+    volumes:
+      - ./app:/app
+      - /var/run/docker.sock:/var/run/docker.sock 
+    restart: always
+    command: sh -c "npm install express nodemailer && node server.js"
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: always
+    command: tunnel --url http://word-editor:3000
+
+  # ── tunnel ที่ 2 แยกต่างหาก สำหรับเว็บ Dashboard (Flask, พอร์ต 5000) ของ AI Server
+  #    Management เอง — ทำให้เข้าจากเครื่องอื่น/router อื่น (นอก WiFi บ้าน) ได้ด้วย
+  #    ไม่ใช่แค่ในวงแลนเดียวกันเหมือนก่อนหน้านี้ ลิงก์จะเปลี่ยนใหม่ทุกครั้งที่เปิดโปรแกรม
+  #    เพราะเป็น cloudflared "quick tunnel" แบบไม่ผูกโดเมนถาวร (ไม่ต้องมี Cloudflare account)
+  dashboard-tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: always
+    # host.docker.internal ชี้กลับไปที่เครื่อง host (main.py รันอยู่นอก container)
+    # บน Docker Desktop (Windows/Mac) จะ resolve เองอัตโนมัติ ส่วน extra_hosts
+    # ใส่ไว้เผื่อรันบน Docker Engine ธรรมดา (Linux) ด้วย จะได้พกไฟล์เดียวใช้ได้ทุกที่
+    command: tunnel --url http://host.docker.internal:5000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

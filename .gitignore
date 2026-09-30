@@ -1,0 +1,33 @@
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+
+# ── PyInstaller build output ──
+# build/ = ไฟล์กลาง (intermediate) ที่ PyInstaller สร้างระหว่าง build — สร้างใหม่ได้เสมอจาก
+# `pyinstaller main.spec` ไม่ควร commit (มีขนาดใหญ่มาก และไม่มีประโยชน์ต้องเก็บไว้)
+# dist/ = ตัว .exe ที่ build เสร็จแล้ว — แจกจ่ายเอง ไม่ต้อง commit เข้า git เช่นกัน
+build/
+dist/
+
+# ── Node (โฟลเดอร์ app/ ของ word-editor) ──
+# docker-compose.yml สั่ง `npm install` ใหม่ทุกครั้งที่ container เริ่ม (ดู docker-compose.yml)
+# จึงไม่จำเป็นต้อง commit node_modules/ เข้า repo
+app/node_modules/
+
+# ── ไฟล์ตั้งค่า/ข้อมูลที่โปรแกรมสร้างเองตอนรัน (เฉพาะเครื่องผู้ใช้แต่ละคน) ──
+# ไม่ควร commit เพราะเป็นข้อมูลส่วนตัวของแต่ละเครื่อง และบางไฟล์มีความลับอยู่ข้างใน เช่น
+# web_users.json (password hash ของบัญชีเว็บ dashboard) และ email_config.json
+# (เก็บ sender_app_password เป็น plaintext — ระวังอย่าแชร์ไฟล์นี้ให้ใครโดยไม่ตั้งใจ)
+app_settings.json
+app_preferences.json
+alert_thresholds.json
+email_config.json
+resource_limits.json
+tracked_containers.json
+web_users.json
+notifier_config.json
+metrics_db.csv
+
+# Isolated Python environment created by build_onefile.bat
+.build-venv/

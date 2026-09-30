@@ -1,0 +1,12 @@
+Intelligent Server Operations Platform — Windows EXE runtime self-test
+Date: 2026-09-23
+Command: Intelligent-Server-Operations-Platform.exe --self-test-relaunch
+[PASS] Tcl/Tk: OK
+[PASS] Bundled resources: OK
+[PASS] All UI themes: OK (current Dark/Gray themes)
+[PASS] Docker Compose YAML: OK
+[PASS] Web login/setup: OK (Flask test client)
+[PASS] Writable app-data: OK
+[PASS] One-file relaunch: OK
+SELF-TEST PASS
+Limit: This verifies runtime/package paths only; it does not measure server performance or exercise real Docker containers/Cloudflare access.
