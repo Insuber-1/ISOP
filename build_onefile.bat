@@ -19,12 +19,13 @@ if not exist "templates\dashboard.html" (
     echo [ERROR] Required web page is missing: templates\dashboard.html
     goto :failed
 )
-if exist "app\package.json" (
-    echo Docker word-editor payload found; it will be included.
-) else (
-    echo [WARNING] app\package.json was not found. The EXE can still be built,
-    echo           but the Docker word-editor feature will not be bundled.
+for %%F in (app\package.json app\package-lock.json app\server.js) do (
+    if not exist "%%F" (
+        echo [ERROR] Required Node.js service file is missing: %%F
+        goto :failed
+    )
 )
+echo Node.js service payload found; app sources will be included in the EXE.
 
 if not exist "%BUILD_PYTHON%" goto :create_venv
 "%BUILD_PYTHON%" --version >nul 2>&1

@@ -3,7 +3,7 @@ ram_ai_manager.py — ระบบปรับ RAM Limit ให้แต่ล�
 
 แนวทางเดียวกับ brain.py (deterministic ไม่ต้องเทรน ไม่ใช่ ML):
 1) อ่านค่า RAM ที่ container ใช้จริง (จาก docker stats ที่โปรแกรมหลัก poll อยู่แล้วทุก 3 วิ)
-2) ทำ EMA (Exponential Moving Average) แยกทีละ container ลด noise/spike ชั่วขณะ
+2) หาค่าเฉลี่ย RAM สะสมของแต่ละวัน แยกทีละ container
 3) คำนวณ RAM limit ใหม่ = ค่าที่ใช้จริงแบบ smoothed x ส่วนเผื่อ (headroom) แล้วปัดขึ้นเป็นก้อน
 4) Hysteresis — ต้องต่างจากค่าปัจจุบันเกิน CHANGE_THRESHOLD_PCT ก่อนถึงจะสั่ง docker update จริง
    กันไม่ให้ปรับถี่จนน่ารำคาญ/container กระตุก
@@ -13,9 +13,15 @@ ram_ai_manager.py — ระบบปรับ RAM Limit ให้แต่ล�
 — ถ้าปิดสวิตช์ (ค่าเริ่มต้น) = Manual ทั้งหมด ระบบนี้จะไม่ไปยุ่งกับ container นั้นเลย
 """
 import math
+import csv
+import os
 import re
 import threading
 import time
+from datetime import datetime
+
+from evidence_log import record_evidence
+from paths import app_path
 
 _MEM_UNIT_MULT_MB = {
     "b": 1 / (1024 * 1024),
@@ -29,6 +35,25 @@ _MEM_UNIT_MULT_MB = {
     "tb": 1024 * 1024,
 }
 _MEM_RE = re.compile(r"([\d.]+)\s*([a-zA-Z]+)")
+_AUTO_RAM_CSV = app_path("auto_ram_history.csv")
+_AUTO_RAM_CSV_LOCK = threading.Lock()
+
+
+def _record_auto_ram_observation(**data):
+    record_evidence("docker_auto_ram_observation", **data)
+    fields = ["time", "container", "enabled", "usage_mb", "ema_mb", "daily_sample_count",
+              "current_limit_mb", "target_limit_mb", "status", "detail"]
+    try:
+        os.makedirs(os.path.dirname(_AUTO_RAM_CSV), exist_ok=True)
+        with _AUTO_RAM_CSV_LOCK:
+            exists = os.path.isfile(_AUTO_RAM_CSV) and os.path.getsize(_AUTO_RAM_CSV) > 0
+            with open(_AUTO_RAM_CSV, "a", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+                if not exists:
+                    writer.writeheader()
+                writer.writerow({"time": datetime.now().astimezone().isoformat(timespec="seconds"), **data})
+    except (OSError, csv.Error) as exc:
+        print(f"[AI RAM] Observation save error: {exc}")
 
 
 def parse_mem_to_mb(text: str):
@@ -54,8 +79,6 @@ class RamAIManager:
     MIN_RAM_MB             = 128    # ต่ำสุดที่จะตั้งให้ไม่ว่ากรณีใด
     ROUND_STEP_MB          = 64     # ปัดขึ้นเป็นก้อน 64MB กันเลขทศนิยมประหลาดๆ
     CHANGE_THRESHOLD_PCT   = 0.15   # ต้องต่างจากค่าปัจจุบันอย่างน้อย 15% ถึงจะสั่งปรับจริง (กัน flapping)
-    EMA_ALPHA              = 0.4    # น้ำหนักค่าใหม่ใน EMA — มากกว่า brain.py เล็กน้อยเพราะ RAM ของ
-                                    # แต่ละ container เปลี่ยนช้ากว่าค่า CPU/RAM รวมทั้งเครื่อง
 
     def __init__(self, get_candidates, is_enabled, get_usage_mb, get_ceiling_mb,
                  get_current_limit_mb, apply_limit, on_log=None, interval_sec: int = 20):
@@ -80,6 +103,7 @@ class RamAIManager:
         self.interval_sec = interval_sec
 
         self._ema: dict = {}
+        self._daily_totals: dict[str, tuple[str, float, int]] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -148,15 +172,28 @@ class RamAIManager:
 
     def _evaluate(self, name: str):
         if not self._is_enabled(name):
-            self._ema.pop(name, None)   # ปิด/ยังไม่เปิด → ล้าง EMA เก่าทิ้ง กันเอาค่าเก่ามาปนตอนเปิดใหม่
+            _record_auto_ram_observation(container=name, enabled=False, usage_mb=None,
+                                         ema_mb=self._ema.get(name),
+                                         current_limit_mb=self._get_current_limit_mb(name),
+                                         target_limit_mb=None, status="disabled")
             return
 
         usage_mb = self._get_usage_mb(name)
         if usage_mb is None or usage_mb <= 0:
+            _record_auto_ram_observation(container=name, enabled=True, usage_mb=None,
+                                         ema_mb=self._ema.get(name),
+                                         current_limit_mb=self._get_current_limit_mb(name),
+                                         target_limit_mb=None, status="usage_unavailable")
             return  # อ่านค่าไม่ได้ตอนนี้ (เช่น container เพิ่ง restart) — ข้ามรอบนี้ไปก่อน
 
-        prev = self._ema.get(name)
-        smoothed = usage_mb if prev is None else (self.EMA_ALPHA * usage_mb + (1 - self.EMA_ALPHA) * prev)
+        day_key = datetime.now().date().isoformat()
+        saved_day, total, count = self._daily_totals.get(name, (day_key, 0.0, 0))
+        if saved_day != day_key:
+            total, count = 0.0, 0
+        total += float(usage_mb)
+        count += 1
+        self._daily_totals[name] = (day_key, total, count)
+        smoothed = total / count
         self._ema[name] = smoothed
 
         ceiling = max(self.MIN_RAM_MB, float(self._get_ceiling_mb() or 4096))
@@ -168,11 +205,23 @@ class RamAIManager:
 
         current = self._get_current_limit_mb(name) or 0
         if current > 0 and abs(target - current) / current < self.CHANGE_THRESHOLD_PCT:
+            _record_auto_ram_observation(container=name, enabled=True, usage_mb=usage_mb,
+                                         ema_mb=smoothed, daily_sample_count=count,
+                                         current_limit_mb=current, target_limit_mb=target,
+                                         status="within_change_threshold")
             return  # ต่างกันไม่พอ (hysteresis) — ไม่ต้องปรับรอบนี้
         if target == current:
+            _record_auto_ram_observation(container=name, enabled=True, usage_mb=usage_mb,
+                                         ema_mb=smoothed, daily_sample_count=count,
+                                         current_limit_mb=current, target_limit_mb=target,
+                                         status="unchanged")
             return
 
         ok, msg = self._apply_limit(name, target)
+        _record_auto_ram_observation(container=name, enabled=True, usage_mb=usage_mb,
+                                     ema_mb=smoothed, daily_sample_count=count,
+                                     current_limit_mb=current, target_limit_mb=target,
+                                     status="applied" if ok else "failed", detail=msg)
         if ok:
             self._on_log(
                 f"🤖 AI RAM: ปรับ {name} จาก {int(current)}MB → {target}MB "

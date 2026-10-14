@@ -28,6 +28,7 @@ class DataCollector:
         # ที่อ่าน metrics_db.csv เสียรูปแบบ
         self.extended_db_file = os.path.join(os.path.dirname(self.db_file), "metrics_extended.csv")
         self.server_health_file = app_path("server_health_history.csv")
+        self.resource_state_file = app_path("resource_state_history.csv")
         self._server_health_lock = threading.Lock()
         self._server_health_saved_at = {}
         self._last_save_monotonic = 0.0
@@ -257,6 +258,30 @@ class DataCollector:
             return list(rows)
         except (OSError, ValueError, csv.Error):
             return []
+
+    def save_resource_state(self, timestamp, raw: dict, ema: dict,
+                            thresholds: dict, status: str) -> bool:
+        """Persist the daily-average resource values and evaluated state as CSV."""
+        fields = ["timestamp", "cpu", "ram", "disk", "ema_cpu", "ema_ram", "ema_disk",
+                  "threshold_cpu", "threshold_ram", "threshold_disk", "status"]
+        try:
+            exists = (os.path.isfile(self.resource_state_file)
+                      and os.path.getsize(self.resource_state_file) > 0)
+            with open(self.resource_state_file, "a", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+                if not exists:
+                    writer.writeheader()
+                writer.writerow({
+                    "timestamp": timestamp,
+                    **{key: raw.get(key) for key in ("cpu", "ram", "disk")},
+                    **{f"ema_{key}": ema.get(key) for key in ("cpu", "ram", "disk")},
+                    **{f"threshold_{key}": thresholds.get(key) for key in ("cpu", "ram", "disk")},
+                    "status": status,
+                })
+            return True
+        except (OSError, csv.Error) as exc:
+            print(f"[Collector] Resource state save error: {exc}")
+            return False
 
     def save_server_health_sample(self, server: str, *, stype: str, online: bool,
                                   latency_ms=None, method: str = "unknown",

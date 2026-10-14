@@ -16,6 +16,7 @@ import glob
 import time
 import threading
 import zipfile
+from evidence_log import record_evidence
 
 BACKUP_PREFIX = "ai_server_backup_"
 
@@ -129,11 +130,21 @@ class BackupScheduler:
         unique_suffix = f"{os.getpid()}_{threading.get_ident()}"
         tmp_path = os.path.join(dest_dir, f".{BACKUP_PREFIX}tmp_{timestamp}_{unique_suffix}.zip")
         final_path = os.path.join(dest_dir, f"{BACKUP_PREFIX}{timestamp}_{unique_suffix}.zip")
+        started = time.perf_counter()
+        files_to_archive = []
+        try:
+            for src in sources:
+                files_to_archive.extend(self._iter_path_files(src, exclude_dir=dest_dir))
+            source_file_count = len(files_to_archive)
+            source_bytes = sum(os.path.getsize(source_file) for source_file, _arcname in files_to_archive)
+        except OSError as e:
+            self._safe_log(f"❌ Backup: อ่านไฟล์ข้อมูลไม่ครบ — {e}", "danger")
+            return
 
         try:
             with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for src in sources:
-                    self._add_path(zf, src)
+                for source_file, arcname in files_to_archive:
+                    zf.write(source_file, arcname)
         except Exception as e:
             self._safe_log(f"❌ Backup ล้มเหลว: {e}", "danger")
             try:
@@ -165,6 +176,21 @@ class BackupScheduler:
                 pass  # ลบไม่ได้ก็เก็บชุดเก่าไว้ เพื่อไม่ให้เสีย backup ที่เพิ่งสำเร็จ
 
         size_mb = os.path.getsize(final_path) / (1024 * 1024)
+        try:
+            with zipfile.ZipFile(final_path, "r") as archive:
+                zip_error = archive.testzip()
+                zipped_count = len(archive.infolist())
+        except (OSError, zipfile.BadZipFile):
+            zip_error = "อ่าน ZIP ไม่ได้"
+            zipped_count = 0
+        elapsed = time.perf_counter() - started
+        record_evidence(
+            "zip_backup", projects=[os.path.basename(os.path.normpath(path)) for path in sources],
+            files_before=source_file_count, source_bytes=source_bytes,
+            files_in_zip=zipped_count, zip_bytes=os.path.getsize(final_path),
+            elapsed_seconds=round(elapsed, 3), zip_openable=zip_error is None,
+            corrupt_member=zip_error,
+        )
         self._safe_log(
             f"💾 Backup สำเร็จ ({len(sources)} รายการ, {size_mb:.2f} MB) → {final_path}"
             + (f" (ลบชุดเก่า {removed} ไฟล์)" if removed else ""),
@@ -173,17 +199,36 @@ class BackupScheduler:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _add_path(zf: zipfile.ZipFile, path: str):
-        """เพิ่มไฟล์เดี่ยวหรือทั้งโฟลเดอร์เข้า zip โดยคงโครงสร้างชื่อไฟล์/โฟลเดอร์เดิมไว้"""
+    def _iter_path_files(path: str, exclude_dir: str | None = None):
+        """Return source files and archive names, excluding the backup destination itself."""
+        excluded = os.path.realpath(exclude_dir) if exclude_dir else None
+        exclude_backup_files_only = bool(excluded and os.path.realpath(path) == excluded)
+        if exclude_backup_files_only:
+            excluded = None
+
+        def is_excluded(candidate):
+            if not excluded:
+                return False
+            try:
+                return os.path.commonpath((os.path.realpath(candidate), excluded)) == excluded
+            except ValueError:
+                return False
+
         if os.path.isdir(path):
             base = os.path.basename(os.path.normpath(path))
-            for root, _dirs, files in os.walk(path):
+            result = []
+            def walk_error(error):
+                raise error
+            for root, dirs, files in os.walk(path, onerror=walk_error):
+                dirs[:] = [directory for directory in dirs
+                           if not is_excluded(os.path.join(root, directory))]
                 for fn in files:
                     full = os.path.join(root, fn)
-                    rel = os.path.join(base, os.path.relpath(full, path))
-                    try:
-                        zf.write(full, rel)
-                    except Exception:
-                        pass  # ไฟล์เดี่ยวๆ อ่านไม่ได้ (เช่นกำลังถูกใช้งานอยู่) ข้ามไปแทนที่จะพังทั้งรอบ
+                    if (not is_excluded(full)
+                            and not (exclude_backup_files_only
+                                     and (fn.startswith(BACKUP_PREFIX) or fn.startswith(f".{BACKUP_PREFIX}tmp_")))):
+                        rel = os.path.join(base, os.path.relpath(full, path))
+                        result.append((full, rel))
+            return result
         else:
-            zf.write(path, os.path.basename(path))
+            return [] if is_excluded(path) else [(path, os.path.basename(path))]

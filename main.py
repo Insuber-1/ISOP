@@ -42,6 +42,7 @@ from backup_manager import BackupScheduler
 from ram_ai_manager import RamAIManager, parse_mem_to_mb
 from ops_kpi import calculate_kpis, read_events
 from paths import APP_DIR, app_path, resource_path, atomic_write_json
+from evidence_log import record_evidence, read_evidence
 # ครอบ subprocess.run()/Popen() ทุกจุดด้วย proc_utils แทนเรียกตรงๆ กันหน้าต่าง CMD ผุดขึ้นมา
 # บน Windows ทุกครั้งที่เรียก docker/docker-compose/ping (ดูเหตุผลเต็มๆ ใน proc_utils.py)
 import proc_utils
@@ -299,7 +300,7 @@ def _run_self_test(relaunch: bool = False) -> int:
     check("Bundled resources", lambda: _self_test_resources())
     check("All UI themes", lambda: _self_test_themes())
     check("Docker Compose YAML", lambda: _self_test_compose())
-    check("Web dashboard without login", lambda: _self_test_web())
+    check("Web dashboard without authentication routes", lambda: _self_test_web())
     check("Writable app-data", lambda: _self_test_data_dir())
 
     if relaunch and getattr(sys, "frozen", False):
@@ -348,6 +349,7 @@ def _self_test_resources():
         "templates/dashboard.html",
         "logo.png", "arch_dark_theme.json", "theme_gray.json",
         "docker-compose.yml",
+        "app/package.json", "app/package-lock.json", "app/server.js",
     ]
     missing = [x for x in required if not os.path.exists(resource_path(x))]
     if missing:
@@ -372,6 +374,12 @@ def _self_test_compose():
             data = yaml.safe_load(f)
         if not isinstance(data, dict):
             raise ValueError(f"Invalid compose YAML: {compose_path}")
+        if not {"word-editor", "tunnel", "dashboard-tunnel"}.issubset(data.get("services", {})):
+            raise ValueError("Compose services word-editor, tunnel and dashboard-tunnel are required")
+    if not os.path.isfile(os.path.join(RUNTIME_APP_DIR, "server.js")):
+        raise FileNotFoundError(os.path.join(RUNTIME_APP_DIR, "server.js"))
+    if not os.path.isfile(os.path.join(RUNTIME_APP_DIR, "package-lock.json")):
+        raise FileNotFoundError(os.path.join(RUNTIME_APP_DIR, "package-lock.json"))
     if os.path.isdir(resource_path("app")) and not os.path.isdir(RUNTIME_APP_DIR):
         raise FileNotFoundError(RUNTIME_APP_DIR)
 
@@ -386,11 +394,11 @@ def _self_test_web():
             raise AssertionError(f"{path} did not open dashboard: {response.status_code}")
     for path in ("/login", "/setup", "/logout"):
         response = client.get(path, follow_redirects=False)
-        if response.status_code != 302 or not response.headers.get("Location", "").endswith("/dashboard"):
-            raise AssertionError(f"{path} did not redirect to dashboard: {response.status_code}")
+        if response.status_code != 404:
+            raise AssertionError(f"obsolete authentication route {path} still exists: {response.status_code}")
     response = client.get("/api/status")
     if response.status_code != 200:
-        raise AssertionError(f"dashboard API requires login: {response.status_code}")
+        raise AssertionError(f"dashboard API is unavailable: {response.status_code}")
 
 
 def _self_test_data_dir():
@@ -768,7 +776,7 @@ class AIServerApp(ctk.CTk):
         self.yaml_paths      = {}
         self.yaml_labels     = {}   # filepath -> ชื่อที่ผู้ใช้ตั้งเอง (กันชื่อซ้ำ)
 
-        # ── ตั้งค่าอีเมลผู้ส่ง (สำหรับปุ่ม "ส่งลิงก์ dashboard" ในแท็บ Dashboard) ──
+        # ── ข้อมูลยืนยันตัวตนของอีเมลผู้ส่ง (หน้า Dashboard ให้กรอกได้เฉพาะผู้รับ) ──
         self._email_config: dict = self._load_email_config()
 
         # ── การตั้งค่าโปรแกรม (เปิดจากปุ่ม ☰ มุมขวาบน): RAM สูงสุด / backup ──
@@ -840,6 +848,8 @@ class AIServerApp(ctk.CTk):
         self._server_dash_widgets: dict = {}   # name -> widget ต่างๆ ในการ์ดของ Server Dashboard
         self._server_manager_status_labels: dict = {}  # name -> ป้ายสถานะใน Server Manager
         self._docker_stats_cache:  dict = {}   # name -> {"online","cpu_pct","mem_usage","mem_pct","disk_str"}
+        self._docker_evidence_last_at: dict[str, float] = {}
+        self._docker_limit_evidence_pending: dict[str, dict] = {}
         self._server_ping_cache: dict = {}     # name -> {"online", "latency_ms", "method", "checked_at"}
         self._remote_metrics_file = app_path("remote_metrics.csv")
         self._remote_metrics_lock = threading.Lock()
@@ -1017,11 +1027,32 @@ class AIServerApp(ctk.CTk):
     def _is_docker_available(self) -> bool:
         """เช็คว่า Docker Desktop/daemon พร้อมใช้งานจริงไหม (ไม่ใช่แค่มีคำสั่ง docker ติดตั้งอยู่)
            กันปัญหา 'Docker Desktop ยังไม่ได้เปิด' หรือเพิ่งเปิดแต่ยังโหลดไม่เสร็จตอนโปรแกรมนี้เริ่ม"""
+        ready, _message = self._docker_status()
+        return ready
+
+    def _docker_status(self) -> tuple[bool, str]:
+        """Return an actionable reason when the Docker CLI or daemon is unavailable."""
         try:
-            r = proc_utils.run_hidden(["docker", "info"], capture_output=True, text=True, timeout=5)
-            return r.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
+            version = proc_utils.run_hidden(
+                ["docker", "--version"], capture_output=True, text=True, timeout=5
+            )
+        except FileNotFoundError:
+            return False, "ไม่พบคำสั่ง docker — ติดตั้ง Docker Desktop/Engine และเพิ่ม docker ใน PATH"
+        except subprocess.TimeoutExpired:
+            return False, "ตรวจสอบ docker --version เกิน 5 วินาที — Docker CLI อาจค้าง"
+        if version.returncode != 0:
+            detail = (version.stderr or version.stdout or "ไม่ทราบสาเหตุ").strip()
+            return False, f"เรียก Docker CLI ไม่สำเร็จ: {detail}"
+        try:
+            info = proc_utils.run_hidden(
+                ["docker", "info"], capture_output=True, text=True, timeout=8
+            )
+        except subprocess.TimeoutExpired:
+            return False, "พบ Docker CLI แต่ daemon ไม่ตอบภายใน 8 วินาที — เปิด Docker Desktop และรอให้พร้อม"
+        if info.returncode != 0:
+            detail = (info.stderr or info.stdout or "ไม่สามารถเชื่อมต่อ Docker daemon").strip()
+            return False, f"พบ Docker CLI แต่เชื่อมต่อ daemon ไม่ได้: {detail}"
+        return True, "Docker CLI และ daemon พร้อมใช้งาน"
 
     def _run_compose(self, args: list) -> tuple[bool, str]:
         """รัน docker compose บนไฟล์ docker-compose.yml ที่อยู่โฟลเดอร์เดียวกับ main.py
@@ -1071,6 +1102,16 @@ class AIServerApp(ctk.CTk):
         if not os.path.exists(COMPOSE_FILE):
             return  # ไม่มีไฟล์ก็ข้ามเงียบๆ ไม่ต้อง log กวนใจ (ไม่ใช่ทุกเครื่องจะมี)
 
+        ready, docker_message = self._docker_status()
+        if not ready and "ไม่พบคำสั่ง docker" in docker_message:
+            self._safe_after(0, self._append_action_log, f"❌ {docker_message}", "danger")
+            self._tunnel_status = "unavailable"
+            self._safe_after(0, self._update_web_url_label)
+            return
+        if not ready:
+            self._safe_after(0, self._append_action_log,
+                      f"⏳ {docker_message} — จะลองเชื่อมต่อใหม่ระหว่างรอสูงสุด 2 นาที", "warning")
+
         waited = 0.0
         max_wait = 120.0
         warned = False
@@ -1083,10 +1124,10 @@ class AIServerApp(ctk.CTk):
                           "กรุณาเปิดแอป Docker Desktop ก่อน แล้วรอสักครู่)", "warning")
                 warned = True
             if waited >= max_wait:
+                _ready, docker_message = self._docker_status()
                 self._safe_after(0, self._append_action_log,
-                          "❌ Docker Desktop ยังไม่พร้อมใช้งานหลังรอ 2 นาที — เปิด Docker Desktop "
-                          "แล้วรอจนไอคอนขึ้นว่า 'Docker Desktop is running' จากนั้นกด "
-                          "🔄 เปิด docker-compose ใหม่ ที่แท็บ Dashboard", "danger")
+                          f"❌ Docker ยังไม่พร้อมหลังรอ 2 นาที: {docker_message} — "
+                          "เปิด Docker Desktop แล้วกด 🔄 เปิด docker-compose ใหม่ ที่แท็บ Dashboard", "danger")
                 self._tunnel_status = "unavailable"
                 self._safe_after(0, self._update_web_url_label)
                 return
@@ -1219,7 +1260,9 @@ class AIServerApp(ctk.CTk):
     # ส่งลิงก์ Dashboard ทางอีเมล (ปุ่ม "✅ ตกลง" ในแท็บ Dashboard)
     # ══════════════════════════════════════════════════════════
     def _load_email_config(self) -> dict:
-        default = {"sender_email": "", "sender_app_password": "",
+        # ล็อกผู้ส่งไว้กับบัญชีระบบ; เก็บ App Password ในไฟล์ข้อมูลของเครื่อง
+        # เพื่อไม่ให้หน้าจอหรือค่าเก่าจาก config เปลี่ยนบัญชีผู้ส่งได้
+        default = {"sender_email": "isop.system01@gmail.com", "sender_app_password": "",
                   "smtp_host": "smtp.gmail.com", "smtp_port": 465}
         if os.path.exists(self.email_config_file):
             try:
@@ -1227,77 +1270,13 @@ class AIServerApp(ctk.CTk):
                     data = json.load(f)
                 merged = dict(default)
                 merged.update(data)
+                merged["sender_email"] = default["sender_email"]
+                merged["smtp_host"] = default["smtp_host"]
+                merged["smtp_port"] = default["smtp_port"]
                 return merged
             except Exception:
                 pass
         return default
-
-    def _save_email_config(self):
-        atomic_write_json(self.email_config_file, self._email_config)
-
-    def _open_email_sender_settings(self):
-        """หน้าต่างตั้งค่าอีเมลผู้ส่ง (ครั้งเดียวพอ) — ค่าเริ่มต้นรองรับ Gmail ผ่าน App Password"""
-        win = ctk.CTkToplevel(self)
-        win.title("⚙️ ตั้งค่าอีเมลผู้ส่ง")
-        win.geometry("420x420")
-        win.transient(self)
-        win.grab_set()
-
-        ctk.CTkLabel(win, text="⚙️ ตั้งค่าอีเมลผู้ส่ง",
-                     font=("Segoe UI", 15, "bold")).pack(pady=(18, 4))
-        ctk.CTkLabel(
-            win,
-            text="ค่าเริ่มต้นตั้งไว้สำหรับ Gmail — ต้องสร้าง 'App Password'\n"
-                 "จาก Google Account ก่อน (ไม่ใช่รหัสผ่าน Gmail ปกติ เพราะ\n"
-                 "Gmail ปิดการ login ด้วยรหัสผ่านตรงๆ ไปแล้ว)",
-            font=("Segoe UI", 11), text_color=Theme.TEXT_MUTED, justify="left"
-        ).pack(padx=20, pady=(0, 14))
-
-        cfg = self._email_config
-
-        ctk.CTkLabel(win, text="อีเมลผู้ส่ง (Gmail)", anchor="w").pack(fill="x", padx=20)
-        sender_entry = ctk.CTkEntry(win, placeholder_text="you@gmail.com")
-        sender_entry.insert(0, cfg.get("sender_email", ""))
-        sender_entry.pack(fill="x", padx=20, pady=(2, 10))
-
-        ctk.CTkLabel(win, text="App Password (16 หลัก)", anchor="w").pack(fill="x", padx=20)
-        pass_entry = ctk.CTkEntry(win, placeholder_text="xxxx xxxx xxxx xxxx", show="•")
-        pass_entry.insert(0, cfg.get("sender_app_password", ""))
-        pass_entry.pack(fill="x", padx=20, pady=(2, 10))
-
-        host_row = ctk.CTkFrame(win, fg_color="transparent")
-        host_row.pack(fill="x", padx=20, pady=(2, 10))
-        host_col = ctk.CTkFrame(host_row, fg_color="transparent")
-        host_col.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ctk.CTkLabel(host_col, text="SMTP Host", anchor="w").pack(fill="x")
-        host_entry = ctk.CTkEntry(host_col)
-        host_entry.insert(0, cfg.get("smtp_host", "smtp.gmail.com"))
-        host_entry.pack(fill="x", pady=(2, 0))
-
-        port_col = ctk.CTkFrame(host_row, fg_color="transparent")
-        port_col.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        ctk.CTkLabel(port_col, text="SMTP Port (SSL)", anchor="w").pack(fill="x")
-        port_entry = ctk.CTkEntry(port_col)
-        port_entry.insert(0, str(cfg.get("smtp_port", 465)))
-        port_entry.pack(fill="x", pady=(2, 0))
-
-        def save():
-            # ช่องว่างหมายถึงให้คงค่า sender ที่ตั้งไว้ ไม่ลบ credential ออกจาก config
-            sender_value = sender_entry.get().strip()
-            password_value = pass_entry.get().strip()
-            self._email_config["sender_email"] = sender_value or cfg.get("sender_email", "")
-            self._email_config["sender_app_password"] = password_value or cfg.get("sender_app_password", "")
-            self._email_config["smtp_host"] = host_entry.get().strip() or "smtp.gmail.com"
-            try:
-                self._email_config["smtp_port"] = int(port_entry.get().strip())
-            except ValueError:
-                self._email_config["smtp_port"] = 465
-            self._save_email_config()
-            msgbox.showinfo("บันทึกแล้ว", "บันทึกการตั้งค่าอีเมลผู้ส่งเรียบร้อย")
-            win.destroy()
-
-        ctk.CTkButton(win, text="💾 บันทึก", fg_color=Theme.SUCCESS, hover_color=Theme.SUCCESS_HOVER,
-                      command=save).pack(pady=18)
 
     def _set_email_status(self, text: str, color: str):
         self.email_status_label.configure(text=text, text_color=color)
@@ -1308,7 +1287,7 @@ class AIServerApp(ctk.CTk):
             self._set_email_status("❌ กรอกอีเมลให้ถูกต้องก่อน", Theme.DANGER)
             return
         if not self._email_config.get("sender_email") or not self._email_config.get("sender_app_password"):
-            self._set_email_status("⚠️ ยังไม่ได้ตั้งค่าอีเมลผู้ส่ง — กด ⚙️ ก่อน", Theme.WARNING)
+            self._set_email_status("⚠️ ไม่พบ App Password ของบัญชีผู้ส่งใน email_config.json", Theme.WARNING)
             return
 
         # ใช้ลิงก์สาธารณะ (เข้าได้จากทุกเครือข่าย) ก่อนเสมอถ้ามี — เข้าเหตุผลที่ผู้ใช้ขอเพิ่มมา
@@ -1374,7 +1353,7 @@ class AIServerApp(ctk.CTk):
                 smtp.sendmail(sender, [to_email], msg.as_string())
             return True, ""
         except smtplib.SMTPAuthenticationError:
-            return False, "เข้าสู่ระบบอีเมลผู้ส่งไม่สำเร็จ (เช็ค App Password ใน ⚙️ ตั้งค่าอีเมลผู้ส่ง)"
+            return False, "เข้าสู่ระบบอีเมลผู้ส่งไม่สำเร็จ (ตรวจสอบ App Password ใน email_config.json)"
         except Exception as e:
             return False, str(e)
 
@@ -1432,11 +1411,15 @@ class AIServerApp(ctk.CTk):
            ปรับ ram_limit_mb ใหม่ + เซฟลง resource_limits.json + สั่ง docker update จริง
            ใช้ apply_resource_limits ตัวเดียวกับตอนบันทึกด้วยมือ กันสองที่ตรรกะไม่ตรงกัน"""
         limits = dict(self.get_limit(name))
+        previous_ram_mb = limits.get("ram_limit_mb", 2048)
         limits["ram_limit_mb"] = new_mb
         limits["ai_ram_enabled"] = True
         self._resource_limits[name] = limits
         self._save_limits()
         ok, msg = self.apply_resource_limits(name)
+        record_evidence("docker_auto_ram", container=name, ram_before_mb=previous_ram_mb,
+                        ram_after_mb=new_mb, outcome="applied" if ok else "failed",
+                        detail=msg)
         self._safe_after(0, self._update_dash_limit_label, name)
         return ok, msg
 
@@ -1475,18 +1458,16 @@ class AIServerApp(ctk.CTk):
     # ระบบ backup อัตโนมัติ
     # ══════════════════════════════════════════════════════════
     def _gather_backup_sources(self) -> list:
-        """รวบรวม path โฟลเดอร์ของ "server" ที่ถูก import เข้าแท็บ Server Manager แล้วเท่านั้น
+        """รวบรวมข้อมูลของแอปและโฟลเดอร์ server ที่ import เข้า Server Manager
            (โฟลเดอร์ที่มี docker-compose.yml ของแต่ละ server วางอยู่ข้างใน จะได้ backup ทั้ง
            โฟลเดอร์ ไม่ใช่แค่ตัวไฟล์ .yml — เพราะข้อมูลจริงของ server เช่น app/, server.js,
            ไฟล์อื่นๆ อยู่ในโฟลเดอร์เดียวกันนี้ทั้งหมด)
 
-           ไม่รวมไฟล์/โค้ดของตัวโปรแกรม Intelligent Server Operations Platform เอง (docker-compose.yml ของ
-           ตัวแอป, ธีม, โลโก้, ไฟล์ตั้งค่าต่างๆ เช่น resource_limits.json/alert_thresholds.json)
-           เพราะสิ่งเหล่านั้นไม่ใช่ "server" ที่ผู้ใช้ import เข้ามา เป็นแค่ไฟล์ของตัวโปรแกรมเอง
            (เรียกใหม่ทุกครั้งที่ backup เพราะรายการเปลี่ยนได้ระหว่างที่โปรแกรมรันอยู่)"""
         seen = set()
         result = []
-        for fdir in self.yaml_paths.values():
+        candidates = [app_path()] + list(self.yaml_paths.values())
+        for fdir in candidates:
             norm = os.path.normpath(fdir)
             if norm not in seen and os.path.isdir(norm):
                 seen.add(norm)
@@ -1978,10 +1959,6 @@ class AIServerApp(ctk.CTk):
         self.email_status_label = ctk.CTkLabel(bottom_row, text="", font=("Segoe UI", 11),
                                                text_color=Theme.TEXT_MUTED, justify="left", anchor="w")
         self.email_status_label.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(bottom_row, text="⚙️ ตั้งค่าอีเมลผู้ส่ง", width=150,
-                      fg_color=Theme.NEUTRAL, hover_color=Theme.NEUTRAL_HOVER,
-                      command=self._open_email_sender_settings).pack(side="right")
-
     def _open_resource_details(self, metric):
         """Show live host details and a searchable list of every accessible process."""
         titles = {"cpu": "CPU Performance", "ram": "RAM Performance", "disk": "Disk Performance"}
@@ -3598,9 +3575,50 @@ class AIServerApp(ctk.CTk):
             key: {"suggestion": value_label.cget("text"), "detail": detail_label.cget("text")}
             for key, (value_label, detail_label) in self._vertical_recommendation_labels.items()
         }
+        selected_evidence = read_evidence(rows[0][0], rows[-1][0])
+        evidence_span = max(0.0, (rows[-1][0] - rows[0][0]).total_seconds())
+        if evidence_span < 60:
+            evidence_interval = "5 วินาที"
+            evidence_interval_seconds = 5
+        elif evidence_span < 5 * 60:
+            evidence_interval = "1 นาที"
+            evidence_interval_seconds = 60
+        elif evidence_span <= 60 * 60:
+            evidence_interval = "5 นาที"
+            evidence_interval_seconds = 300
+        elif evidence_span <= 24 * 60 * 60:
+            evidence_interval = "1 ชั่วโมง"
+            evidence_interval_seconds = 3600
+        elif evidence_span <= 31 * 24 * 60 * 60:
+            evidence_interval = "1 วัน"
+            evidence_interval_seconds = 86400
+        else:
+            evidence_interval = "1 เดือน"
+            evidence_interval_seconds = None
         snapshot = {"title": period_title, "rows": rows, "averages": averages,
                     "p95": p95, "minimums": minimums, "maximums": maximums,
                     "recommendations": recommendations, "buckets": buckets,
+                    "evidence": selected_evidence,
+                    "all_resource_history": list(getattr(self, "_history_rows", [])),
+                    "evidence_interval": evidence_interval,
+                    "evidence_interval_seconds": evidence_interval_seconds,
+                    "resource_state": {
+                        "ema": dict(getattr(self.brain, "_ema", {})),
+                        "thresholds": self.brain.get_thresholds(),
+                        "anomaly_active": bool(getattr(self.brain, "_anomaly_active", False)),
+                        "anomaly_keys": sorted(getattr(self.brain, "_anomaly_keys", set())),
+                    },
+                    "docker_containers": [
+                        {"name": name, "stats": dict(self._docker_stats_cache.get(name, {})),
+                         "limits": dict(self.get_limit(name))}
+                        for name, info in self.tracked_containers.items()
+                        if info.get("stype") == "docker"
+                    ],
+                    "backup": {
+                        "enabled": bool(self.prefs.get("backup_enabled")),
+                        "projects": [os.path.basename(os.path.normpath(path))
+                                     for path in self._gather_backup_sources()],
+                    },
                     "period": period,
                     "bucket_interval": {"ภาพรวมทั้งหมด": "รายวัน", "รายเดือน": "รายวัน",
                                         "รายวัน": "รายชั่วโมง", "รายชั่วโมง": "ทุก 5 นาที"}.get(period, "รายวัน"),
@@ -3688,7 +3706,121 @@ class AIServerApp(ctk.CTk):
             font_name = "ResourceThai"
 
             page_width, page_height = landscape(A4)
-            page_count = 2 + math.ceil(len(report["buckets"]) / 35)
+            evidence = [item for item in report.get("evidence", [])
+                        if item.get("kind") != "resource_state"]
+            # Reuse all historical raw metrics to rebuild EMA rows for older data too.
+            replay_brain = AIServerBrain()
+            selected_start, selected_end = report["rows"][0][0], report["rows"][-1][0]
+            for timestamp, old_cpu, old_ram, old_disk in sorted(
+                    report.get("all_resource_history", []), key=lambda sample: sample[0]):
+                status = replay_brain.check_anomaly(
+                    {"cpu": old_cpu, "ram": old_ram, "disk": old_disk}, timestamp=timestamp)
+                if selected_start <= timestamp <= selected_end:
+                    evidence.append({
+                        "time": timestamp.isoformat(timespec="seconds"), "kind": "resource_state",
+                        "data": {"raw": {"cpu": old_cpu, "ram": old_ram, "disk": old_disk},
+                                 "ema": dict(replay_brain._ema),
+                                 "thresholds": replay_brain.get_thresholds(),
+                                 "state": "Warning" if status == -1 else "Normal",
+                                 "source": "reconstructed_from_metrics_history"},
+                    })
+            evidence.sort(key=lambda item: item.get("time", ""))
+            interval = report.get("evidence_interval", "5 นาที")
+            interval_seconds = report.get("evidence_interval_seconds") or 86400
+
+            def bucket_for(item):
+                at = datetime.fromisoformat(item["time"])
+                if at.tzinfo is not None:
+                    at = at.astimezone().replace(tzinfo=None)
+                if interval == "1 เดือน":
+                    start = at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    stamp = int(at.timestamp())
+                    start = datetime.fromtimestamp(stamp - stamp % interval_seconds)
+                return start, start.strftime("%Y-%m" if interval == "1 เดือน" else "%Y-%m-%d %H:%M:%S")
+
+            def mean_for(items, field, nested=None):
+                values = []
+                for item in items:
+                    value = item.get("data", {}).get(field)
+                    if nested and isinstance(value, dict):
+                        value = value.get(nested)
+                    if isinstance(value, (int, float)) and math.isfinite(value):
+                        values.append(float(value))
+                return sum(values) / len(values) if values else None
+
+            grouped_resources = {}
+            grouped_docker = {}
+            grouped_zip = {}
+            for item in evidence:
+                start, label = bucket_for(item)
+                kind, data = item.get("kind"), item.get("data", {})
+                if kind == "resource_state":
+                    grouped_resources.setdefault((start, label), []).append(item)
+                elif kind and kind.startswith("docker_"):
+                    grouped_docker.setdefault((start, label, data.get("container", "—")), []).append(item)
+                elif kind == "zip_backup":
+                    grouped_zip.setdefault((start, label), []).append(item)
+
+            resource_rows = []
+            for (start, label), items in sorted(grouped_resources.items()):
+                raw = {key: mean_for(items, "raw", key) for key in ("cpu", "ram", "disk")}
+                ema = {key: mean_for(items, "ema", key) for key in ("cpu", "ram", "disk")}
+                thresholds = {key: mean_for(items, "thresholds", key) for key in ("cpu", "ram", "disk")}
+                warning_count = sum(item.get("data", {}).get("state") == "Warning" for item in items)
+                resource_rows.append({"time": label, "kind": "resource_average",
+                                      "data": {"raw": raw, "ema": ema, "thresholds": thresholds,
+                                               "state": "Warning" if warning_count > len(items) / 2 else "Normal",
+                                               "sample_count": len(items)}})
+
+            docker_rows = []
+            for (start, label, container), items in sorted(grouped_docker.items()):
+                all_data = [item.get("data", {}) for item in items]
+                cpu_values = [d.get(key) for d in all_data
+                              for key in ("cpu_pct", "before_cpu_pct", "after_cpu_pct")
+                              if isinstance(d.get(key), (int, float))]
+                ram_values = [d.get(key) for d in all_data
+                              for key in ("ram_usage_mb", "before_ram_mb", "after_ram_mb")
+                              if isinstance(d.get(key), (int, float))]
+                cpu_caps = [d.get(key) for d in all_data
+                            for key in ("cpu_limit_pct", "requested_cpu_limit_pct")
+                            if isinstance(d.get(key), (int, float))]
+                ram_caps = [d.get(key) for d in all_data
+                            for key in ("ram_limit_mb", "requested_ram_limit_mb")
+                            if isinstance(d.get(key), (int, float))]
+                docker_rows.append({"time": label, "kind": "docker_average", "data": {
+                    "container": container, "cpu_avg": sum(cpu_values) / len(cpu_values) if cpu_values else None,
+                    "ram_avg_mb": sum(ram_values) / len(ram_values) if ram_values else None,
+                    "cpu_limit_avg": sum(cpu_caps) / len(cpu_caps) if cpu_caps else None,
+                    "ram_limit_avg": sum(ram_caps) / len(ram_caps) if ram_caps else None,
+                    "sample_count": sum(item.get("kind") == "docker_sample" for item in items),
+                    "operation_count": sum(item.get("kind") in
+                                            ("docker_limit", "docker_limit_after", "docker_auto_ram")
+                                            for item in items),
+                    "auto_ram_count": sum(item.get("kind") == "docker_auto_ram" for item in items),
+                }})
+
+            zip_rows = []
+            for (start, label), items in sorted(grouped_zip.items()):
+                data_rows = [item.get("data", {}) for item in items]
+                projects = sorted({name for data in data_rows for name in data.get("projects", [])})
+                def zip_mean(key):
+                    vals = [data[key] for data in data_rows if isinstance(data.get(key), (int, float))]
+                    return sum(vals) / len(vals) if vals else None
+                zip_rows.append({"time": label, "kind": "zip_average", "data": {
+                    "projects": ", ".join(projects) or "—", "backup_count": len(data_rows),
+                    "files_before": zip_mean("files_before"), "source_bytes": zip_mean("source_bytes"),
+                    "zip_bytes": zip_mean("zip_bytes"), "elapsed_seconds": zip_mean("elapsed_seconds"),
+                    "openable_percent": 100 * sum(data.get("zip_openable") is True for data in data_rows) / len(data_rows),
+                }})
+            evidence_groups = {"resource_state": resource_rows, "docker": docker_rows, "zip_backup": zip_rows}
+            zip_record_count = len(zip_rows)
+            evidence_pages = (
+                max(1, math.ceil(len(evidence_groups["resource_state"]) / 26))
+                + max(1, math.ceil(len(evidence_groups["docker"]) / 26))
+                + max(1, math.ceil(zip_record_count / 26))
+            )
+            page_count = 3 + evidence_pages + math.ceil(len(report["buckets"]) / 35)
             pdf = pdf_canvas.Canvas(temporary, pagesize=(page_width, page_height), pageCompression=1)
             pdf.setTitle(f"Resource performance report - {report['title']}")
             pdf.setAuthor("Intelligent Server Operations Platform")
@@ -3723,6 +3855,38 @@ class AIServerApp(ctk.CTk):
                 pdf.line(34, 28, page_width - 34, 28)
                 text(f"Intelligent Server Operations Platform  |  {page_number}/{page_count}",
                      36, 16, 7, "#667789")
+
+            def evidence_table(title, entries, headers, row_values, first_page):
+                page_number = first_page
+                chunks = [entries[index:index + 26] for index in range(0, len(entries), 26)] or [[]]
+                for chunk_index, chunk in enumerate(chunks):
+                    text(title, 36, page_height - 38, 14, "#13243A")
+                    text(f"ช่วงข้อมูล: {report['title']}  ·  เฉลี่ยทุก {interval}  ·  "
+                         f"รวม {len(entries):,} ช่วง", 36, page_height - 59, 8, "#526477")
+                    pdf.setFillColor(colors.HexColor("#EAF0F5"))
+                    pdf.roundRect(34, page_height - 92, page_width - 68, 22, 4, fill=1, stroke=0)
+                    for x, header in headers:
+                        text(header, x, page_height - 85, 7, "#253446")
+                    if not chunk:
+                        text("ไม่มีหลักฐานที่บันทึกในช่วงเวลานี้", 42, page_height - 116, 8, "#667789")
+                    for index, item in enumerate(chunk):
+                        y = page_height - 109 - index * 16
+                        for x, value in row_values(item):
+                            text(str(value)[:34], x, y, 7, "#253446")
+                        pdf.setStrokeColor(colors.HexColor("#E4EAF0"))
+                        pdf.setLineWidth(0.35)
+                        pdf.line(38, y - 4, page_width - 38, y - 4)
+                    footer(page_number)
+                    page_number += 1
+                    if chunk_index < len(chunks) - 1:
+                        pdf.showPage()
+                return page_number
+
+            def fmt_mean(value, suffix="%"):
+                return "—" if value is None else f"{value:.1f}{suffix}"
+
+            def fmt_bytes(value):
+                return "—" if value is None else f"{value / (1024 ** 2):.1f} MB"
 
             # Overview, summary table, chart, and sizing recommendations.
             text("Resource Performance Report / รายงานการใช้ทรัพยากร", 36, page_height - 38,
@@ -3797,6 +3961,126 @@ class AIServerApp(ctk.CTk):
             footer(1)
             pdf.showPage()
 
+            # Point-in-time results from the EMA evaluator, Docker manager, and ZIP backup setup.
+            text("สถานะทรัพยากรและ Docker ณ เวลาส่งออกรายงาน", 36, page_height - 38,
+                 14, "#13243A")
+            state = report.get("resource_state", {})
+            text("EMA / เกณฑ์ประเมิน", 36, page_height - 68, 10, "#087E75")
+            status_text = "ผิดปกติ" if state.get("anomaly_active") else "ปกติ"
+            text(f"สถานะรวม: {status_text}", 36, page_height - 87, 9,
+                 "#C0392B" if state.get("anomaly_active") else "#228B62")
+            pdf.setFillColor(colors.HexColor("#EAF0F5"))
+            pdf.roundRect(34, page_height - 128, page_width - 68, 24, 4, fill=1, stroke=0)
+            ema_columns = ((42, "ทรัพยากร"), (190, "ค่า EMA (%)"), (310, "เกณฑ์ประเมิน (%)"),
+                           (465, "ผล") )
+            for x, heading in ema_columns:
+                text(heading, x, page_height - 120, 8, "#253446")
+            ema = state.get("ema", {})
+            thresholds = state.get("thresholds", {})
+            for row_index, (key, label) in enumerate((("cpu", "CPU"), ("ram", "RAM"),
+                                                       ("disk", "Disk"))):
+                y = page_height - 149 - row_index * 19
+                value = ema.get(key)
+                threshold = thresholds.get(key)
+                result = "ผิดปกติ" if key in state.get("anomaly_keys", []) else "ปกติ"
+                text(label, 42, y, 8, "#253446")
+                text("—" if value is None else f"{value:.1f}", 190, y, 8, "#253446")
+                text("—" if threshold is None else f"{threshold:.1f}", 310, y, 8, "#253446")
+                text(result, 465, y, 8, "#C0392B" if result == "ผิดปกติ" else "#228B62")
+
+            docker_top = page_height - 224
+            text("Docker container และเพดานทรัพยากร", 36, docker_top, 10, "#087E75")
+            docker_columns = ((42, "Container"), (250, "CPU ใช้ (%)"),
+                              (345, "RAM ใช้"), (455, "เพดาน CPU (%)"),
+                              (560, "เพดาน RAM (MB)"), (680, "Auto RAM"))
+            pdf.setFillColor(colors.HexColor("#EAF0F5"))
+            pdf.roundRect(34, docker_top - 28, page_width - 68, 22, 4, fill=1, stroke=0)
+            for x, heading in docker_columns:
+                text(heading, x, docker_top - 21, 7, "#253446")
+            containers = report.get("docker_containers", [])
+            for index, item in enumerate(containers[:9]):
+                y = docker_top - 43 - index * 16
+                stats, limits = item.get("stats", {}), item.get("limits", {})
+                name = str(item.get("name", ""))
+                text(name[:30], 42, y, 7, "#253446")
+                text(f"{stats['cpu_pct']:.1f}" if stats.get("online") else "offline",
+                     250, y, 7, "#253446")
+                text(str(stats.get("mem_usage", "—"))[:15], 345, y, 7, "#253446")
+                text(str(limits.get("cpu_limit", 100)), 455, y, 7, "#253446")
+                text(str(limits.get("ram_limit_mb", 2048)), 560, y, 7, "#253446")
+                text("เปิด" if limits.get("ai_ram_enabled") else "ปิด", 680, y, 7, "#253446")
+            if not containers:
+                text("ไม่มี Docker container ที่นำเข้ามาใน Server Manager", 42,
+                     docker_top - 45, 8, "#667789")
+            if len(containers) > 9:
+                text(f"แสดง 9 จาก {len(containers)} container", 42,
+                     docker_top - 43 - 9 * 16, 7, "#667789")
+
+            backup = report.get("backup", {})
+            backup_y = 91
+            text(f"ZIP backup: {'เปิดใช้งาน' if backup.get('enabled') else 'ปิดใช้งาน'}  ·  "
+                 f"โครงการที่ตั้งค่าไว้ {len(backup.get('projects', []))} รายการ",
+                 36, backup_y, 8, "#526477")
+            project_names = backup.get("projects", [])
+            if project_names:
+                text("รายการ: " + ", ".join(project_names[:6])
+                     + (f" และอีก {len(project_names) - 6} รายการ" if len(project_names) > 6 else ""),
+                     36, backup_y - 14, 7, "#667789")
+            footer(2)
+            pdf.showPage()
+
+            evidence_page = evidence_table(
+                "ค่าจริง, EMA และสถานะ",
+                evidence_groups["resource_state"],
+                ((36, "เวลา"), (145, "CPU จริง"), (215, "EMA CPU"),
+                 (295, "RAM จริง"), (370, "EMA RAM"), (450, "Disk จริง"),
+                 (525, "EMA Disk"), (615, "สถานะ"), (690, "ตัวอย่าง")),
+                lambda item: (
+                    (36, item.get("time", "")[:19]),
+                    (145, fmt_mean(item['data'].get('raw', {}).get('cpu'))),
+                    (215, fmt_mean(item['data'].get('ema', {}).get('cpu'))),
+                    (295, fmt_mean(item['data'].get('raw', {}).get('ram'))),
+                    (370, fmt_mean(item['data'].get('ema', {}).get('ram'))),
+                    (450, fmt_mean(item['data'].get('raw', {}).get('disk'))),
+                    (525, fmt_mean(item['data'].get('ema', {}).get('disk'))),
+                    (615, item['data'].get('state', "—")),
+                    (690, item['data'].get('sample_count', 0))), 3)
+            pdf.showPage()
+
+            def docker_evidence_row(item):
+                data = item.get("data", {})
+                return ((36, item.get("time", "")[:19]),
+                        (155, data.get("container", "—")), (270, data.get("sample_count", 0)),
+                        (325, fmt_mean(data.get("cpu_avg"))),
+                        (405, fmt_mean(data.get("ram_avg_mb"), " MB")),
+                        (510, fmt_mean(data.get("cpu_limit_avg"))),
+                        (600, fmt_mean(data.get("ram_limit_avg"), " MB")),
+                        (710, f"{data.get('auto_ram_count', 0)}/{data.get('operation_count', 0)}"))
+
+            evidence_page = evidence_table(
+                "Docker, การจำกัดทรัพยากร และ Auto RAM",
+                evidence_groups["docker"],
+                ((36, "ช่วงเวลา"), (155, "Container"), (270, "ตัวอย่าง"),
+                 (325, "CPU เฉลี่ย"), (405, "RAM เฉลี่ย"),
+                 (510, "CPU limit เฉลี่ย"), (600, "RAM limit เฉลี่ย"), (710, "Auto/เหตุการณ์")),
+                docker_evidence_row, evidence_page)
+            pdf.showPage()
+            evidence_page = evidence_table(
+                "ผลการสำรอง ZIP",
+                evidence_groups["zip_backup"],
+                ((36, "ช่วงเวลา"), (150, "โครงการ"), (300, "ไฟล์เฉลี่ย"),
+                 (410, "ก่อน ZIP เฉลี่ย"), (515, "หลัง ZIP เฉลี่ย"),
+                 (620, "เวลาเฉลี่ย (s)"), (725, "เปิดได้ (%)")),
+                lambda item: ((36, item.get("time", "")[:19]),
+                              (150, item["data"].get("projects", "—")),
+                              (300, fmt_mean(item["data"].get("files_before"), "")),
+                              (410, fmt_bytes(item["data"].get("source_bytes"))),
+                              (515, fmt_bytes(item["data"].get("zip_bytes"))),
+                              (620, fmt_mean(item["data"].get("elapsed_seconds"), "")),
+                              (725, fmt_mean(item["data"].get("openable_percent")))),
+                evidence_page)
+            pdf.showPage()
+
             # Historical Graph trend: solid lines show bucket averages; dashed lines show peaks.
             text("Historical Graph / แนวโน้มการใช้ทรัพยากร", 36, page_height - 38,
                  15, "#13243A")
@@ -3865,12 +4149,12 @@ class AIServerApp(ctk.CTk):
                 legend_x += 185
             text("จำนวนตัวอย่างดิบ: " + f"{len(report['rows']):,}  ·  สรุปเป็น {len(trend):,} ช่วง",
                  36, 56, 8, "#526477")
-            footer(2)
+            footer(evidence_page)
             pdf.showPage()
 
             # Keep every period in the report, but show averaged/peak buckets instead of raw samples.
             chunk_size = 35
-            for page_index, start in enumerate(range(0, len(trend), chunk_size), start=3):
+            for page_index, start in enumerate(range(0, len(trend), chunk_size), start=evidence_page + 1):
                 text("Averaged historical data / ข้อมูลสรุปตามช่วงเวลา", 36, page_height - 38,
                      15, "#13243A")
                 text(f"ช่วงข้อมูล: {report['title']}  ·  เฉลี่ย{report['bucket_interval']}  ·  "
@@ -4545,6 +4829,32 @@ class AIServerApp(ctk.CTk):
         self._docker_stats_cache = new_cache
         now = time.time()
         for name, stats in new_cache.items():
+            limit = self.get_limit(name)
+            pending = self._docker_limit_evidence_pending.get(name)
+            if pending and stats.get("online"):
+                record_evidence(
+                    "docker_limit_after", container=name,
+                    before_cpu_pct=pending.get("before_cpu_pct"),
+                    before_ram_usage=pending.get("before_ram_usage"),
+                    before_ram_mb=pending.get("before_ram_mb"),
+                    after_cpu_pct=stats.get("cpu_pct"), after_ram_usage=stats.get("mem_usage"),
+                    after_ram_mb=parse_mem_to_mb(stats.get("mem_usage", "")),
+                    cpu_limit_pct=limit.get("cpu_limit", 100),
+                    ram_limit_mb=limit.get("ram_limit_mb", 2048),
+                    auto_ram=bool(limit.get("ai_ram_enabled")),
+                    seconds_after=round(now - pending.get("at", now), 1),
+                )
+                self._docker_limit_evidence_pending.pop(name, None)
+            if now - self._docker_evidence_last_at.get(name, 0.0) >= 60:
+                record_evidence(
+                    "docker_sample", container=name, online=bool(stats.get("online")),
+                    cpu_pct=stats.get("cpu_pct"), ram_usage=stats.get("mem_usage"),
+                    ram_usage_mb=parse_mem_to_mb(stats.get("mem_usage", "")),
+                    ram_pct=stats.get("mem_pct"), cpu_limit_pct=limit.get("cpu_limit", 100),
+                    ram_limit_mb=limit.get("ram_limit_mb", 2048),
+                    auto_ram=bool(limit.get("ai_ram_enabled")),
+                )
+                self._docker_evidence_last_at[name] = now
             self._safe_after(0, self._sync_server_manager_status, name,
                              stats.get("online", False), stats.get("health", "unknown"))
             health = stats.get("health", "unknown")
@@ -5074,7 +5384,9 @@ class AIServerApp(ctk.CTk):
         ctk.CTkLabel(info_frame, text=display, font=("Segoe UI", 13),
                      width=200, anchor="w").pack(side="left", padx=10, pady=6)
 
-        status_text, status_color = self.get_real_status(name, stype, ip)
+        status_text, status_color = self.get_real_status(
+            name, stype, ip, yaml_filename=yaml_filename, service_name=service_name
+        )
         status_label = ctk.CTkLabel(info_frame, text=status_text,
                                     text_color=status_color, font=("Segoe UI", 12, "bold"))
         status_label.pack(side="left", padx=8)
@@ -5662,8 +5974,33 @@ class AIServerApp(ctk.CTk):
         threading.Thread(target=_kill, daemon=True).start()
 
     # ── Status check ─────────────────────────────────────────
-    def get_real_status(self, name, server_type="docker", ip=""):
+    def get_real_status(self, name, server_type="docker", ip="",
+                        yaml_filename="", service_name=""):
         if server_type == "docker":
+            tracked = self.tracked_containers.get(name, {})
+            yaml_filename = yaml_filename or tracked.get("yaml_key", "")
+            service_name = service_name or tracked.get("service_name", "")
+            work_dir = self.yaml_paths.get(yaml_filename)
+            if work_dir and service_name and yaml_filename:
+                # Compose-generated container names differ from the service name.
+                # Ask Compose for this service's running container instead of inspecting
+                # the assumed name directly.
+                compose_file = os.path.abspath(yaml_filename)
+                for cmd in (
+                    ["docker", "compose", "-f", compose_file, "ps", "-q", service_name],
+                    ["docker-compose", "-f", compose_file, "ps", "-q", service_name],
+                ):
+                    try:
+                        r = proc_utils.run_hidden(
+                            cmd, cwd=work_dir, capture_output=True, text=True, timeout=8
+                        )
+                        if r.returncode == 0:
+                            if r.stdout.strip():
+                                return "🟢 Online", Theme.SUCCESS
+                            return "⚫ Offline", Theme.TEXT_MUTED
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+
             try:
                 r = proc_utils.run_hidden(
                     ["docker", "inspect", "-f", "{{.State.Running}}", name],
@@ -5758,62 +6095,115 @@ class AIServerApp(ctk.CTk):
         else:
             os.system(f"x-terminal-emulator -e docker logs -f {container_name} &")
 
+    def _run_compose_service_action(self, compose_file, work_dir, service_name, args):
+        """Run an action against the imported Compose service, not an assumed container name.
+
+        Containers without an explicit ``container_name`` receive a generated Docker name,
+        so ``docker stop <service-name>`` fails even though Compose knows the service.
+        Keep all lifecycle actions scoped to the exact imported Compose file.
+        """
+        compose_path = os.path.abspath(compose_file) if compose_file else ""
+        if not compose_path or not os.path.isfile(compose_path):
+            return False, f"ไม่พบไฟล์ Compose: {compose_file or '(ไม่ได้ระบุไฟล์)'}"
+
+        candidates = [
+            ["docker", "compose", "-f", compose_path, *args, service_name],
+            ["docker-compose", "-f", compose_path, *args, service_name],
+        ]
+        errors = []
+        for cmd in candidates:
+            try:
+                r = proc_utils.run_hidden(
+                    cmd, cwd=work_dir or os.path.dirname(compose_path),
+                    capture_output=True, text=True, timeout=120
+                )
+                if r.returncode == 0:
+                    return True, (r.stdout or "").strip()
+                errors.append((r.stderr or r.stdout or "ไม่ทราบสาเหตุ").strip())
+            except FileNotFoundError:
+                errors.append(f"ไม่พบคำสั่ง {cmd[0]}")
+            except subprocess.TimeoutExpired:
+                errors.append(f"คำสั่ง {' '.join(args)} timeout")
+        return False, "\n".join(error for error in errors if error) or "ไม่สามารถสั่ง Docker Compose ได้"
+
     def control_server(self, action, name, status_label,
                        server_type, yaml_filename="", service_name="", ip=""):
         work_dir = self.yaml_paths.get(yaml_filename)
+        is_compose_service = bool(work_dir and service_name and yaml_filename)
+
+        def run_docker_action(docker_args, compose_args):
+            if is_compose_service:
+                return self._run_compose_service_action(
+                    yaml_filename, work_dir, service_name, compose_args
+                )
+            try:
+                r = proc_utils.run_hidden(
+                    docker_args, capture_output=True, text=True, timeout=120
+                )
+                if r.returncode == 0:
+                    return True, (r.stdout or "").strip()
+                return False, (r.stderr or r.stdout or "ไม่ทราบสาเหตุ").strip()
+            except FileNotFoundError:
+                return False, "ไม่พบคำสั่ง docker บนเครื่องนี้"
+            except subprocess.TimeoutExpired:
+                return False, f"คำสั่ง docker {' '.join(docker_args[1:])} timeout"
 
         def task():
             if server_type == "docker":
                 try:
                     if action == "start":
                         status_label.configure(text="⏳ Starting...", text_color=Theme.WARNING)
-                        if work_dir and service_name:
-                            r = proc_utils.run_hidden(
-                                f"docker-compose up -d {service_name}",
-                                shell=True, cwd=work_dir, capture_output=True, text=True
-                            )
-                        else:
-                            r = proc_utils.run_hidden(["docker", "start", name],
-                                               capture_output=True, text=True)
-                        if r.returncode == 0:
+                        ok, output = run_docker_action(
+                            ["docker", "start", name], ["up", "-d"]
+                        )
+                        if ok:
                             status_label.configure(text="🟢 Online", text_color=Theme.SUCCESS)
                             self.apply_resource_limits(name)
                             self._safe_after(0, self._update_dash_limit_label, name)
-                            # เปิด Terminal สตรีม log ของ server นี้ใน Server Dashboard ทันที
                             self.start_log_stream(name)
                             self._mark_server_dash_online(name, True)
                         else:
                             status_label.configure(text="⚫ Offline", text_color=Theme.TEXT_MUTED)
-                            self._safe_after(0, lambda: msgbox.showerror(
-                                "Docker Error", f"ไม่สามารถเปิด {name}\n\n{r.stderr}"))
+                            self._safe_after(0, lambda err=output: msgbox.showerror(
+                                "Docker Error", f"ไม่สามารถเปิด {name}\n\n{err}"))
 
                     elif action == "stop":
                         status_label.configure(text="⏳ Stopping...", text_color=Theme.WARNING)
-                        r = proc_utils.run_hidden(["docker", "stop", name], capture_output=True, text=True)
-                        status_label.configure(
-                            text="⚫ Offline" if r.returncode == 0 else "🟢 Online",
-                            text_color=Theme.TEXT_MUTED if r.returncode == 0 else Theme.SUCCESS
+                        ok, output = run_docker_action(
+                            ["docker", "stop", name], ["stop"]
                         )
-                        if r.returncode == 0:
+                        status_label.configure(
+                            text="⚫ Offline" if ok else "❌ Stop failed",
+                            text_color=Theme.TEXT_MUTED if ok else Theme.DANGER
+                        )
+                        if ok:
                             self.stop_log_stream(name)
                             self._mark_server_dash_online(name, False)
+                        else:
+                            self._safe_after(0, lambda err=output: msgbox.showerror(
+                                "Docker Error", f"ไม่สามารถปิด {name}\n\n{err}"))
 
                     elif action == "restart":
                         status_label.configure(text="🟡 Restarting...", text_color=Theme.WARNING)
-                        r = proc_utils.run_hidden(["docker", "restart", name], capture_output=True, text=True)
-                        status_label.configure(
-                            text="🟢 Online" if r.returncode == 0 else "❌ Error",
-                            text_color=Theme.SUCCESS if r.returncode == 0 else Theme.DANGER
+                        ok, output = run_docker_action(
+                            ["docker", "restart", name], ["restart"]
                         )
-                        if r.returncode == 0:
+                        status_label.configure(
+                            text="🟢 Online" if ok else "❌ Restart failed",
+                            text_color=Theme.SUCCESS if ok else Theme.DANGER
+                        )
+                        if ok:
                             self.apply_resource_limits(name)
                             self._safe_after(0, self._update_dash_limit_label, name)
                             self.start_log_stream(name)
                             self._mark_server_dash_online(name, True)
+                        else:
+                            self._safe_after(0, lambda err=output: msgbox.showerror(
+                                "Docker Error", f"ไม่สามารถ restart {name}\n\n{err}"))
 
                 except Exception as e:
                     status_label.configure(text="❌ Error", text_color=Theme.DANGER)
-                    self._safe_after(0, lambda: msgbox.showerror("Error", str(e)))
+                    self._safe_after(0, lambda error=str(e): msgbox.showerror("Error", error))
             else:
                 # Physical server
                 if action == "start":
@@ -5847,6 +6237,7 @@ class AIServerApp(ctk.CTk):
         limits = self._resource_limits.get(server_name)
         if not limits:
             return False, "ไม่มีค่า limit ที่บันทึกไว้"
+        before_stats = dict(self._docker_stats_cache.get(server_name, {}))
         cpu_pct = limits.get("cpu_limit", 100)
         ram_mb  = limits.get("ram_limit_mb", 2048)
         try:
@@ -5870,9 +6261,26 @@ class AIServerApp(ctk.CTk):
         actual_mb = docker_ops.get_actual_memory_mb(server_name)
         if actual_mb != ram_mb:
             shown = f"{actual_mb} MB" if actual_mb else "ไม่จำกัด (unlimited)"
-            return False, (f"สั่งไปแล้วแต่ container ยังไม่ได้ใช้ {ram_mb} MB จริง (ตอนนี้เป็น {shown}) — "
-                            "ลอง ⏹ Stop แล้ว ▶ Start container ใหม่อีกครั้ง")
-        return True, f"ตั้ง RAM {ram_mb} MB / CPU {cpu_pct}% เรียบร้อย และตรวจสอบแล้วว่า container ใช้ค่านี้จริง"
+            message = (f"สั่งไปแล้วแต่ container ยังไม่ได้ใช้ {ram_mb} MB จริง (ตอนนี้เป็น {shown}) — "
+                       "ลอง ⏹ Stop แล้ว ▶ Start container ใหม่อีกครั้ง")
+            record_evidence("docker_limit", container=server_name, before_cpu_pct=before_stats.get("cpu_pct"),
+                            before_ram_usage=before_stats.get("mem_usage"),
+                            before_ram_mb=parse_mem_to_mb(before_stats.get("mem_usage", "")),
+                            requested_cpu_limit_pct=cpu_pct, requested_ram_limit_mb=ram_mb,
+                            actual_ram_limit_mb=actual_mb, outcome="failed", detail=message)
+            return False, message
+        message = f"ตั้ง RAM {ram_mb} MB / CPU {cpu_pct}% เรียบร้อย และตรวจสอบแล้วว่า container ใช้ค่านี้จริง"
+        self._docker_limit_evidence_pending[server_name] = {
+            "at": time.time(), "before_cpu_pct": before_stats.get("cpu_pct"),
+            "before_ram_usage": before_stats.get("mem_usage"),
+            "before_ram_mb": parse_mem_to_mb(before_stats.get("mem_usage", "")),
+        }
+        record_evidence("docker_limit", container=server_name, before_cpu_pct=before_stats.get("cpu_pct"),
+                        before_ram_usage=before_stats.get("mem_usage"),
+                        before_ram_mb=parse_mem_to_mb(before_stats.get("mem_usage", "")),
+                        requested_cpu_limit_pct=cpu_pct, requested_ram_limit_mb=ram_mb,
+                        actual_ram_limit_mb=actual_mb, outcome="applied")
+        return True, message
 
     def _update_dash_limit_label(self, server_name):
         """อัปเดตข้อความ CPU/RAM Limit ที่แสดงในการ์ด Server Dashboard ให้ตรงกับค่าที่ตั้งไว้ล่าสุด
@@ -6916,8 +7324,15 @@ class AIServerApp(ctk.CTk):
     def _update_realtime_status_once(self):
         # ─ อ่าน metrics จริงจาก psutil ─
         current = self.collector.get_current_metrics()
+        status = self.brain.check_anomaly(current)
+        ema_values = dict(getattr(self.brain, "_ema", {}))
+        thresholds = self.brain.get_thresholds()
+        resource_status = "Warning" if status == -1 else "Normal"
         history_saved = self.collector.save_to_db(current)
         if history_saved:
+            self.collector.save_resource_state(
+                current.get("timestamp", datetime.now().astimezone().isoformat(timespec="seconds")),
+                current, ema_values, thresholds, resource_status)
             self.brain.add_lstm_sample(current)
             self._lstm_samples_since_fit += 1
             if (self._lstm_samples_since_fit >= 36
@@ -6955,7 +7370,12 @@ class AIServerApp(ctk.CTk):
         self.disk_bar.set(disk / 100.0)
 
         # ─ Risk score (EMA แบบเสถียร ไม่ต้องเทรน) ─
-        status = self.brain.check_anomaly(current)
+        record_evidence(
+            "resource_state", raw={key: float(current.get(key, 0)) for key in ("cpu", "ram", "disk")},
+            ema=ema_values,
+            thresholds=thresholds,
+            state=resource_status,
+        )
         risk    = self.brain.get_risk_score()
         trend   = self.brain.predict_trend()
         self.risk_label.configure(text=f"⚠️ Risk Score: {risk:.0f}%")

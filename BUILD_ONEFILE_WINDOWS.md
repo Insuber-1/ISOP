@@ -13,7 +13,8 @@ Self-test ตรวจ:
 - resource ภายใน EXE ครบ
 - theme ดำ/เทาโหลดได้ทั้งหมด
 - `docker-compose.yml` และ `app/` ถูกฝังและคัดลอกไป runtime ได้
-- Flask Login/Setup/Dashboard ทำงานแบบ first-run
+- Node.js service มี `server.js`, `package.json` และ `package-lock.json`; Compose รัน `/health` check
+- Flask dashboard/API ทำงาน และไม่มี route Login/Setup/Logout
 - ข้อมูลสามารถเขียนใน `%LOCALAPPDATA%` ได้
 - EXE แบบ one-file สามารถเปิดตัวเองซ้ำได้
 

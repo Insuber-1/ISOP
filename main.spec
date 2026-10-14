@@ -16,6 +16,18 @@ def collect_app_data_without_node_modules(root):
             collected.append((source, destination))
     return collected
 
+
+required_build_files = [
+    "docker-compose.yml",
+    "templates/dashboard.html",
+    "app/server.js",
+    "app/package.json",
+    "app/package-lock.json",
+]
+missing_build_files = [path for path in required_build_files if not os.path.isfile(path)]
+if missing_build_files:
+    raise SystemExit("ERROR: Required one-file build resources are missing: " + ", ".join(missing_build_files))
+
 # On Python versions with regular Tcl/Tk folders, collect them into the explicit
 # locations used by runtime_tk.py. Python 3.14+ may expose the libraries through
 # zipfs instead; in that case PyInstaller's built-in _tkinter hook collects them.

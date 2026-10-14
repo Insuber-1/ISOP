@@ -10,12 +10,12 @@ import math
 import random
 import os
 import time
+from datetime import datetime
 from statistics import median
 from lstm_model import ResourceLSTM
 from paths import app_path
 
 class AIServerBrain:
-    EMA_ALPHA      = 0.3     # น้ำหนักค่าใหม่ใน EMA (0-1) — น้อย = เรียบ/เสถียรกว่า, มาก = ไวกว่า
     ANOMALY_ENTER  = 90.0    # เกณฑ์ fallback ก่อน baseline มีข้อมูลเพียงพอ และเพดานเกณฑ์ปรับตัว
     ANOMALY_EXIT   = 80.0    # ส่วนต่าง hysteresis จากเกณฑ์เข้า
     BASELINE_MIN_SAMPLES = 30
@@ -30,6 +30,9 @@ class AIServerBrain:
         # พร้อมใช้งานทันที ไม่ต้องเทรน
         self.is_trained = True
         self._ema = {"cpu": None, "ram": None, "disk": None}
+        self._ema_day = None
+        self._ema_day_totals = {"cpu": 0.0, "ram": 0.0, "disk": 0.0}
+        self._ema_day_counts = {"cpu": 0, "ram": 0, "disk": 0}
         self._history_cpu:  list[float] = []   # เก็บค่า EMA ล่าสุด 20 ตัว (สำหรับ trend)
         self._history_ram:  list[float] = []
         self._history_disk: list[float] = []
@@ -235,9 +238,14 @@ class AIServerBrain:
                 "method": "Isolation Forest" if self._forest else "warmup"}
 
     # ------------------------------------------------------------------
-    def _update_ema(self, key: str, value: float) -> float:
-        prev = self._ema[key]
-        smoothed = value if prev is None else (self.EMA_ALPHA * value + (1 - self.EMA_ALPHA) * prev)
+    def _update_ema(self, key: str, value: float, day_key: str) -> float:
+        if self._ema_day != day_key:
+            self._ema_day = day_key
+            self._ema_day_totals = {metric: 0.0 for metric in self._ema}
+            self._ema_day_counts = {metric: 0 for metric in self._ema}
+        self._ema_day_totals[key] += float(value)
+        self._ema_day_counts[key] += 1
+        smoothed = self._ema_day_totals[key] / self._ema_day_counts[key]
         self._ema[key] = smoothed
         return smoothed
 
@@ -254,14 +262,25 @@ class AIServerBrain:
     # ------------------------------------------------------------------
     # ตรวจ anomaly แบบ deterministic (EMA + hysteresis)  คืน -1 (ผิดปกติ) หรือ 1 (ปกติ)
     # ------------------------------------------------------------------
-    def check_anomaly(self, metrics: dict) -> int:
+    def check_anomaly(self, metrics: dict, timestamp=None) -> int:
         cpu  = metrics.get('cpu',  0)
         ram  = metrics.get('ram',  0)
         disk = metrics.get('disk', 0)
 
-        cpu_s  = self._update_ema('cpu',  cpu)
-        ram_s  = self._update_ema('ram',  ram)
-        disk_s = self._update_ema('disk', disk)
+        if isinstance(timestamp, datetime):
+            day_key = timestamp.astimezone().date().isoformat() if timestamp.tzinfo else timestamp.date().isoformat()
+        elif timestamp is not None:
+            try:
+                parsed = datetime.fromisoformat(str(timestamp))
+                day_key = parsed.astimezone().date().isoformat() if parsed.tzinfo else parsed.date().isoformat()
+            except (TypeError, ValueError):
+                day_key = datetime.now().date().isoformat()
+        else:
+            day_key = datetime.now().date().isoformat()
+
+        cpu_s  = self._update_ema('cpu',  cpu, day_key)
+        ram_s  = self._update_ema('ram',  ram, day_key)
+        disk_s = self._update_ema('disk', disk, day_key)
 
         for lst, val in [(self._history_cpu, cpu_s),
                          (self._history_ram, ram_s),

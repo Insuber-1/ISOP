@@ -25,6 +25,10 @@ RESOURCE_LIMITS_FILE = app_path("resource_limits.json")
 DEFAULT_LIMITS = {"cpu_limit": 100, "ram_limit_mb": 2048}
 
 
+class DockerUnavailableError(RuntimeError):
+    """Docker CLI or daemon cannot be reached; preserve the actionable detail."""
+
+
 # ══════════════════════════════════════════════════════════
 # รายชื่อ container
 # ══════════════════════════════════════════════════════════
@@ -37,7 +41,8 @@ def list_containers() -> list[dict]:
             capture_output=True, text=True, timeout=8
         )
         if r.returncode != 0:
-            return []
+            detail = (r.stderr or r.stdout or "Docker ส่งผลลัพธ์ผิดพลาดโดยไม่มีรายละเอียด").strip()
+            raise DockerUnavailableError(f"docker ps -a ล้มเหลว: {detail}")
         out = []
         for line in r.stdout.strip().splitlines():
             parts = line.split("|")
@@ -56,8 +61,10 @@ def list_containers() -> list[dict]:
                 "running": state.lower() == "running",
             })
         return out
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+    except FileNotFoundError as exc:
+        raise DockerUnavailableError("ไม่พบคำสั่ง docker — ติดตั้ง Docker Desktop/Engine และเพิ่ม docker ใน PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DockerUnavailableError("docker ps -a ใช้เวลานานเกิน 8 วินาที — ตรวจสอบว่า Docker daemon ยังตอบสนอง") from exc
 
 
 
@@ -142,8 +149,16 @@ def _ping_host(ip: str):
 
 
 def docker_ping(name: str) -> tuple[bool, str]:
-    r = proc_utils.run_hidden(["docker", "inspect", "-f", "{{.State.Running}}", name],
-                        capture_output=True, text=True, timeout=5)
+    try:
+        r = proc_utils.run_hidden(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                            capture_output=True, text=True, timeout=5)
+    except FileNotFoundError:
+        return False, "ไม่พบคำสั่ง docker — ติดตั้ง Docker Desktop/Engine และเพิ่ม docker ใน PATH"
+    except subprocess.TimeoutExpired:
+        return False, "ตรวจสถานะ container ไม่สำเร็จ: docker inspect timeout"
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "ไม่พบ container หรือ Docker daemon ไม่พร้อม").strip()
+        return False, f"ตรวจสถานะ container '{name}' ไม่สำเร็จ: {detail}"
     if "true" not in r.stdout.lower():
         return False, "container ไม่ได้ทำงาน (offline)"
 
@@ -268,22 +283,39 @@ def diagnose_tunnel(container_name: str = "dashboard-tunnel") -> dict:
     # for containers created by older releases.
     target = container_name
     try:
-        lookup = proc_utils.run_hidden(
+        # Prefer this app's Compose project, then fall back to the service label alone.
+        # The fallback handles containers created by older builds or by a different
+        # Compose project name; Compose service containers are not guaranteed to use
+        # the literal service name as their Docker container name.
+        lookup_commands = [
             ["docker", "ps", "-a", "--filter", "label=com.docker.compose.project=ai-server-management",
              "--filter", f"label=com.docker.compose.service={container_name}", "--format", "{{.ID}}"],
-            capture_output=True, text=True, timeout=5
-        )
-        if lookup.returncode == 0 and lookup.stdout.strip():
-            target = lookup.stdout.strip().splitlines()[0].strip()
+            ["docker", "ps", "-a", "--filter", f"label=com.docker.compose.service={container_name}",
+             "--format", "{{.ID}}"],
+        ]
+        for lookup_cmd in lookup_commands:
+            lookup = proc_utils.run_hidden(
+                lookup_cmd, capture_output=True, text=True, timeout=5
+            )
+            if lookup.returncode == 0 and lookup.stdout.strip():
+                target = lookup.stdout.strip().splitlines()[0].strip()
+                break
         r = proc_utils.run_hidden(
-            ["docker", "inspect", "-f", "{{.State.Running}}", target],
+            ["docker", "inspect", "-f",
+             "{{.State.Status}}|{{.State.ExitCode}}|{{.State.Error}}|{{.State.Running}}", target],
             capture_output=True, text=True, timeout=5
         )
         if r.returncode != 0:
             result["error"] = (r.stderr or r.stdout or "ไม่พบ container").strip()
             return result
+        state, exit_code, state_error, running = (r.stdout.strip().split("|", 3) + [""] * 4)[:4]
         result["exists"] = True
-        result["running"] = "true" in r.stdout.lower()
+        result["running"] = running.strip().lower() == "true"
+        if not result["running"]:
+            detail = f"container หยุดทำงาน (สถานะ: {state or 'unknown'}, exit code: {exit_code or 'unknown'})"
+            if state_error.strip():
+                detail += f" — {state_error.strip()}"
+            result["error"] = detail
     except FileNotFoundError:
         result["error"] = "ไม่พบคำสั่ง docker บนเครื่องนี้"
         return result

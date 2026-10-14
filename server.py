@@ -5,7 +5,7 @@ server.py — Web server สำหรับดูสถานะระบบจ�
 วิธีทำงาน:
 - main.py เก็บข้อมูล metrics/anomaly แล้วเรียก web_state.update(...) ทุกครั้งที่เช็คสถานะ
 - หน้าเว็บ dashboard.html จะ poll API /api/status ทุก 2 วินาทีเพื่ออัปเดตหน้าจอ
-- Dashboard และ API เปิดโดยไม่ต้อง Login/Setup
+- Dashboard และ API เปิดใช้งานโดยตรง
 
 รันแยกจาก main.py ไม่ได้ตั้งใจ — ถูกออกแบบให้ main.py import แล้วสั่ง start
 เป็น background thread ในตัวเอง (รันไฟล์เดียวจบ)
@@ -163,19 +163,6 @@ def create_app() -> Flask:
     def index():
         return redirect(url_for("dashboard"))
 
-    # Old links remain valid but the login and setup pages are no longer served.
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        return redirect(url_for("dashboard"))
-
-    @app.route("/setup", methods=["GET", "POST"])
-    def setup():
-        return redirect(url_for("dashboard"))
-
-    @app.route("/logout")
-    def logout():
-        return redirect(url_for("dashboard"))
-
     def _is_tracked_server(name: str) -> bool:
         """Allow remote operations only for servers imported into Server Manager."""
         return name in _load_tracked_container_names()
@@ -208,7 +195,11 @@ def create_app() -> Flask:
         #  ทุกตัวบนเครื่อง รวมถึงตัวที่ auto-start จาก docker-compose.yml ของโปรแกรมเอง
         #  ทั้งที่ยังไม่ได้กด Import ผ่านหน้าเว็บ/แอปเลย)
         tracked = _load_tracked_container_names()
-        containers = [c for c in docker_ops.list_containers() if c["name"] in tracked]
+        try:
+            all_containers = docker_ops.list_containers()
+        except docker_ops.DockerUnavailableError as exc:
+            return jsonify({"error": str(exc), "containers": []}), 503
+        containers = [c for c in all_containers if c["name"] in tracked]
         running_names = [c["name"] for c in containers if c.get("running")]
         stats = _get_container_stats(running_names)
         for c in containers:
